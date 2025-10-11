@@ -323,6 +323,159 @@ def render_history_chart(portfolio_history: pd.Series) -> None:
     st.plotly_chart(fig, config=PLOTLY_CONFIG)
 
 
+def forecast_portfolio_returns(
+    price_history: pd.DataFrame,
+    snapshot: pd.DataFrame,
+    horizon_days: int,
+    simulations: int,
+    lookback_days: int,
+    method: str,
+) -> Optional[dict]:
+    if (
+        price_history.empty
+        or snapshot.empty
+        or horizon_days <= 0
+        or simulations <= 0
+        or len(price_history.columns) == 0
+    ):
+        return None
+
+    if lookback_days > 0 and len(price_history) > lookback_days:
+        price_history = price_history.iloc[-lookback_days:]
+
+    daily_returns = price_history.pct_change().dropna()
+    if daily_returns.empty or len(daily_returns) < 5:
+        return None
+
+    log_returns = np.log1p(daily_returns)
+    mu = log_returns.mean().to_numpy()
+    cov = log_returns.cov().to_numpy()
+    if not np.all(np.isfinite(mu)) or not np.all(np.isfinite(cov)):
+        return None
+
+    if "Market Value" not in snapshot.columns:
+        return None
+
+    if "Ticker" in snapshot.columns:
+        market_values = snapshot.set_index("Ticker")["Market Value"]
+    else:
+        market_values = snapshot["Market Value"]
+        market_values.index = snapshot.index
+
+    weights = (
+        market_values.reindex(price_history.columns)
+        .fillna(0)
+    )
+    total_value = weights.sum()
+    if total_value <= 0:
+        return None
+
+    weights = (weights / total_value).to_numpy()
+    simulations = min(int(simulations), 10000)
+    horizon_days = int(horizon_days)
+
+    rng = np.random.default_rng()
+    draws: np.ndarray
+    if method == "Bootstrap" and len(log_returns) >= horizon_days:
+        history = log_returns.to_numpy()
+        random_idx = rng.integers(0, history.shape[0], size=(simulations, horizon_days))
+        draws = history[random_idx]
+    else:
+        try:
+            draws = rng.multivariate_normal(mu, cov, size=(simulations, horizon_days))
+        except np.linalg.LinAlgError:
+            variances = np.clip(np.diag(cov), a_min=1e-10, a_max=None)
+            std_dev = np.sqrt(variances)
+            draws = rng.normal(
+                loc=mu,
+                scale=std_dev,
+                size=(simulations, horizon_days, len(mu)),
+            )
+
+    cumulative_log_returns = draws.sum(axis=1)
+    asset_returns = np.expm1(cumulative_log_returns)
+    portfolio_returns = asset_returns @ weights
+    if not np.all(np.isfinite(portfolio_returns)):
+        return None
+
+    expected = float(np.mean(portfolio_returns))
+    median = float(np.median(portfolio_returns))
+    downside = float(np.percentile(portfolio_returns, 5))
+    upside = float(np.percentile(portfolio_returns, 95))
+
+    return {
+        "expected_return": expected,
+        "median_return": median,
+        "downside": downside,
+        "upside": upside,
+        "simulated_returns": portfolio_returns,
+        "current_value": float(total_value),
+    }
+
+
+def render_forecast_section(
+    price_history: pd.DataFrame,
+    snapshot: pd.DataFrame,
+    horizon_days: int,
+    simulations: int,
+    lookback_days: int,
+    method: str,
+) -> None:
+    results = forecast_portfolio_returns(
+        price_history,
+        snapshot,
+        horizon_days,
+        simulations,
+        lookback_days,
+        method,
+    )
+    if not results:
+        st.info("More price history is required to produce a near-term forecast.")
+        return
+
+    current_value = results["current_value"]
+    expected_value = current_value * (1 + results["expected_return"])
+    downside_value = current_value * (1 + results["downside"])
+    upside_value = current_value * (1 + results["upside"])
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric(
+        f"Expected {horizon_days}-day Return",
+        f"{results['expected_return']*100:,.2f}%",
+        delta=f"${expected_value - current_value:,.0f}",
+    )
+    col2.metric(
+        f"Median {horizon_days}-day Return",
+        f"{results['median_return']*100:,.2f}%",
+        delta=f"${current_value * (1 + results['median_return']) - current_value:,.0f}",
+    )
+    col3.metric(
+        "Downside (5th pct)",
+        f"{results['downside']*100:,.2f}%",
+        delta=f"${downside_value - current_value:,.0f}",
+    )
+    col4.metric(
+        "Upside (95th pct)",
+        f"{results['upside']*100:,.2f}%",
+        delta=f"${upside_value - current_value:,.0f}",
+    )
+
+    st.caption(
+        "Monte Carlo forecast using recent daily log returns. "
+        f"Method: {method}. Downside and upside show the 5th and 95th percentile outcomes."
+    )
+    histogram_df = pd.DataFrame(
+        {"Simulated Return %": results["simulated_returns"] * 100}
+    )
+    hist_fig = px.histogram(
+        histogram_df,
+        x="Simulated Return %",
+        nbins=40,
+        title="Distribution of Simulated Portfolio Returns",
+    )
+    st.plotly_chart(hist_fig, config=PLOTLY_CONFIG)
+
+
 def render_download_button(snapshot: pd.DataFrame) -> None:
     if snapshot.empty:
         return
@@ -357,6 +510,33 @@ def main() -> None:
         step=0.25,
     )
     sidebar.caption("Live quotes are fetched from Yahoo Finance when you run or update the dashboard.")
+    sidebar.subheader("Forecast settings")
+    forecast_horizon_days = sidebar.number_input(
+        "Forecast horizon (days)",
+        min_value=1,
+        max_value=90,
+        value=7,
+        step=1,
+    )
+    simulation_count = sidebar.slider(
+        "Monte Carlo simulations",
+        min_value=200,
+        max_value=5000,
+        value=2000,
+        step=100,
+    )
+    lookback_days = sidebar.slider(
+        "Historical lookback (days)",
+        min_value=30,
+        max_value=720,
+        value=252,
+        step=30,
+    )
+    forecast_method = sidebar.selectbox(
+        "Simulation method",
+        options=("Bootstrap", "Gaussian"),
+        index=0,
+    )
 
     if "portfolio_table" not in st.session_state:
         st.session_state["portfolio_table"] = default_portfolio_table()
@@ -448,8 +628,8 @@ def main() -> None:
 
     render_summary_metrics(snapshot, risk_free_rate_pct / 100)
 
-    tab_overview, tab_history, tab_download = st.tabs(
-        ["Overview", "Performance", "Export"]
+    tab_overview, tab_history, tab_forecast, tab_download = st.tabs(
+        ["Overview", "Performance", "Forecast", "Export"]
     )
     with tab_overview:
         render_portfolio_table(snapshot)
@@ -477,6 +657,16 @@ def main() -> None:
         )
         if not portfolio_returns.empty:
             st.bar_chart(portfolio_returns, width="stretch")
+
+    with tab_forecast:
+        render_forecast_section(
+            price_history,
+            snapshot,
+            forecast_horizon_days,
+            simulation_count,
+            lookback_days,
+            forecast_method,
+        )
 
     with tab_download:
         render_download_button(snapshot)
