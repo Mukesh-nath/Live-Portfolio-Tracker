@@ -190,8 +190,12 @@ def render_summary_metrics(snapshot: pd.DataFrame, risk_free_rate: float) -> Non
     total_cost = snapshot["Cost Basis"].sum()
     total_pl = snapshot["Unrealized P/L"].sum()
     day_change = snapshot["Daily Change"].sum(min_count=1)
+    if "DCF Holding Value" in snapshot:
+        dcf_total = snapshot["DCF Holding Value"].sum(min_count=1)
+    else:
+        dcf_total = np.nan
 
-    col_a, col_b, col_c, col_d = st.columns(4)
+    col_a, col_b, col_c, col_d, col_e = st.columns(5)
     col_a.metric("Portfolio Value", f"${total_value:,.2f}")
     if not math.isfinite(total_pl):
         col_b.metric("Unrealized P/L", "—")
@@ -212,6 +216,10 @@ def render_summary_metrics(snapshot: pd.DataFrame, risk_free_rate: float) -> Non
         col_d.metric("Daily Change", f"${day_change:,.2f}", delta_pct_display)
     else:
         col_d.metric("Daily Change", "—")
+    if math.isfinite(dcf_total):
+        col_e.metric("DCF Portfolio Value", f"${dcf_total:,.2f}")
+    else:
+        col_e.metric("DCF Portfolio Value", "—")
 
     st.markdown("---")
 
@@ -254,34 +262,38 @@ def render_portfolio_table(snapshot: pd.DataFrame) -> None:
 
     display_df = snapshot.copy()
     display_df.index.name = "Ticker"
-    display_df = display_df[
-        [
-            "Shares",
-            "Purchase Price",
-            "Current Price",
-            "Market Value",
-            "Cost Basis",
-            "Unrealized P/L",
-            "Return %",
-            "Daily Change",
-            "Daily Change %",
-        ]
+    columns = [
+        "Shares",
+        "Purchase Price",
+        "Current Price",
+        "Market Value",
+        "Cost Basis",
+        "Unrealized P/L",
+        "Return %",
+        "Daily Change",
+        "Daily Change %",
     ]
+    if "DCF Per Share" in display_df.columns:
+        columns.extend(["DCF Per Share", "DCF Holding Value"])
+    display_df = display_df[columns]
+
+    formatters = {
+        "Shares": "{:,.2f}",
+        "Purchase Price": "${:,.2f}",
+        "Current Price": "${:,.2f}",
+        "Market Value": "${:,.2f}",
+        "Cost Basis": "${:,.2f}",
+        "Unrealized P/L": "${:,.2f}",
+        "Return %": "{:,.2f}%",
+        "Daily Change": "${:,.2f}",
+        "Daily Change %": "{:,.2f}%",
+    }
+    if "DCF Per Share" in display_df.columns:
+        formatters["DCF Per Share"] = "${:,.2f}"
+        formatters["DCF Holding Value"] = "${:,.2f}"
 
     st.dataframe(
-        display_df.style.format(
-            {
-                "Shares": "{:,.2f}",
-                "Purchase Price": "${:,.2f}",
-                "Current Price": "${:,.2f}",
-                "Market Value": "${:,.2f}",
-                "Cost Basis": "${:,.2f}",
-                "Unrealized P/L": "${:,.2f}",
-                "Return %": "{:,.2f}%",
-                "Daily Change": "${:,.2f}",
-                "Daily Change %": "{:,.2f}%",
-            }
-        ),
+        display_df.style.format(formatters),
         width="stretch",
     )
 
@@ -476,6 +488,112 @@ def render_forecast_section(
     st.plotly_chart(hist_fig, config=PLOTLY_CONFIG)
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_dcf_inputs(symbol: str) -> Optional[Tuple[float, float]]:
+    cleaned = symbol.strip().upper()
+    if not cleaned:
+        return None
+    try:
+        ticker = yf.Ticker(cleaned)
+    except Exception:
+        return None
+
+    try:
+        cashflow = ticker.cashflow
+        if cashflow.empty:
+            return None
+        cashflow = cashflow.fillna(np.nan)
+        if "Free Cash Flow" in cashflow.index:
+            fcf = cashflow.loc["Free Cash Flow"].iloc[0]
+        else:
+            operating_cf = cashflow.loc.get("Total Cash From Operating Activities")
+            capex = cashflow.loc.get("Capital Expenditures")
+            if operating_cf is None or capex is None:
+                return None
+            fcf = operating_cf.iloc[0] + capex.iloc[0]
+    except Exception:
+        return None
+
+    try:
+        shares_outstanding = ticker.info.get("sharesOutstanding")
+    except Exception:
+        shares_outstanding = None
+
+    if shares_outstanding in (None, 0) or fcf in (None, 0) or not np.isfinite(fcf):
+        return None
+
+    return float(fcf), float(shares_outstanding)
+
+
+def calculate_dcf_per_share(
+    fcf: float,
+    shares_outstanding: float,
+    growth_rate: float,
+    discount_rate: float,
+    terminal_growth_rate: float,
+    projection_years: int,
+) -> Optional[float]:
+    if shares_outstanding <= 0 or projection_years <= 0:
+        return None
+    if discount_rate <= terminal_growth_rate:
+        return None
+
+    fcf_per_share = fcf / shares_outstanding
+    if not np.isfinite(fcf_per_share) or fcf_per_share <= 0:
+        return None
+
+    present_value = 0.0
+    for year in range(1, projection_years + 1):
+        projected = fcf_per_share * (1 + growth_rate) ** year
+        discount_factor = (1 + discount_rate) ** year
+        present_value += projected / discount_factor
+
+    terminal_fcf = fcf_per_share * (1 + growth_rate) ** projection_years
+    terminal_value = terminal_fcf * (1 + terminal_growth_rate) / (
+        discount_rate - terminal_growth_rate
+    )
+    present_value += terminal_value / ((1 + discount_rate) ** projection_years)
+    return present_value
+
+
+def append_dcf_columns(
+    snapshot: pd.DataFrame,
+    growth_rate: float,
+    discount_rate: float,
+    terminal_growth_rate: float,
+    projection_years: int,
+) -> pd.DataFrame:
+    if snapshot.empty:
+        snapshot["DCF Per Share"] = np.nan
+        snapshot["DCF Holding Value"] = np.nan
+        return snapshot
+
+    snapshot = snapshot.copy()
+    snapshot["DCF Per Share"] = np.nan
+    snapshot["DCF Holding Value"] = np.nan
+
+    for ticker in snapshot.index:
+        inputs = fetch_dcf_inputs(str(ticker))
+        if not inputs:
+            continue
+        fcf, shares_outstanding = inputs
+        value = calculate_dcf_per_share(
+            fcf,
+            shares_outstanding,
+            growth_rate,
+            discount_rate,
+            terminal_growth_rate,
+            projection_years,
+        )
+        if value and np.isfinite(value):
+            snapshot.loc[ticker, "DCF Per Share"] = value
+            snapshot.loc[ticker, "DCF Holding Value"] = (
+                snapshot.loc[ticker, "Shares"] * value
+            )
+
+    return snapshot
+
+
 def render_download_button(snapshot: pd.DataFrame) -> None:
     if snapshot.empty:
         return
@@ -496,6 +614,9 @@ def main() -> None:
     )
     sidebar = st.sidebar
     sidebar.header("Configuration")
+
+    sidebar.caption("Live quotes are fetched from Yahoo Finance when you run or update the dashboard.")
+    sidebar.subheader("Forecast settings")
     default_start = date.today() - timedelta(days=365)
     history_start = sidebar.date_input(
         "Price history start date",
@@ -509,8 +630,7 @@ def main() -> None:
         value=2.0,
         step=0.25,
     )
-    sidebar.caption("Live quotes are fetched from Yahoo Finance when you run or update the dashboard.")
-    sidebar.subheader("Forecast settings")
+    sidebar.markdown("---")
     forecast_horizon_days = sidebar.number_input(
         "Forecast horizon (days)",
         min_value=1,
@@ -538,10 +658,48 @@ def main() -> None:
         index=0,
     )
 
+    sidebar.subheader("Valuation options")
+    enable_dcf = sidebar.checkbox("Enable DCF valuation", value=True)
+    if enable_dcf:
+        dcf_growth_rate_pct = sidebar.number_input(
+            "FCF growth rate (annual, %)",
+            min_value=-10.0,
+            max_value=40.0,
+            value=5.0,
+            step=0.5,
+        )
+        dcf_discount_rate_pct = sidebar.number_input(
+            "Discount rate (annual, %)",
+            min_value=2.0,
+            max_value=30.0,
+            value=10.0,
+            step=0.5,
+        )
+        dcf_terminal_growth_pct = sidebar.number_input(
+            "Terminal growth rate (%, < discount)",
+            min_value=-5.0,
+            max_value=10.0,
+            value=2.0,
+            step=0.25,
+        )
+        dcf_projection_years = sidebar.slider(
+            "Projection horizon (years)",
+            min_value=3,
+            max_value=10,
+            value=5,
+            step=1,
+        )
+        if dcf_discount_rate_pct <= dcf_terminal_growth_pct:
+            sidebar.warning("Terminal growth rate should be less than the discount rate for DCF stability.")
+    else:
+        dcf_growth_rate_pct = dcf_discount_rate_pct = dcf_terminal_growth_pct = dcf_projection_years = None
+    sidebar.markdown("---")
+
     if "portfolio_table" not in st.session_state:
         st.session_state["portfolio_table"] = default_portfolio_table()
 
-    sidebar.subheader("Add ticker from Yahoo Finance")
+    sidebar.subheader("Portfolio editor")
+    sidebar.caption("Add ticker from Yahoo Finance")
     with sidebar.form("add_ticker_form"):
         new_ticker = st.text_input("Ticker symbol", placeholder="e.g. NVDA")
         new_shares = st.number_input(
@@ -625,6 +783,22 @@ def main() -> None:
     if snapshot.empty:
         st.error("Portfolio data could not be computed. Please review your inputs.")
         return
+
+    snapshot = snapshot.drop(columns=["DCF Per Share", "DCF Holding Value"], errors="ignore")
+
+    if enable_dcf and None not in (
+        dcf_growth_rate_pct,
+        dcf_discount_rate_pct,
+        dcf_terminal_growth_pct,
+        dcf_projection_years,
+    ):
+        snapshot = append_dcf_columns(
+            snapshot,
+            dcf_growth_rate_pct / 100,
+            dcf_discount_rate_pct / 100,
+            dcf_terminal_growth_pct / 100,
+            int(dcf_projection_years),
+        )
 
     render_summary_metrics(snapshot, risk_free_rate_pct / 100)
 
